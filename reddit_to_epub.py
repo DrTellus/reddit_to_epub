@@ -1,42 +1,42 @@
 #!/usr/bin/env python3
 """
-reddit_to_epub.py  –  Reddit → EPUB for Xteink X4
-===================================================
+reddit_to_epub.py  –  Reddit → EPUB
+=====================================
 
-Laster ned tekstposter fra Reddit og pakker dem som en pen EPUB-fil.
-Ingen API-nøkkel nødvendig.
+Downloads self-post stories from any subreddit and packages them as a
+clean, well-formatted EPUB file. No API key required.
 
-Installasjon:
+Installation:
     pip install requests ebooklib markdown
 
 ─────────────────────────────────────────────────────────────────────
-EKSEMPLER
+EXAMPLES
 ─────────────────────────────────────────────────────────────────────
 
-  # Topp 25 fra r/hfy noensinne
+  # Top 25 posts from r/HFY of all time
   python reddit_to_epub.py --sub hfy --time all --limit 25
 
-  # Topp 50 fra r/nosleep dette året, kun OC-flair
+  # Top 50 from r/nosleep this year, OC flair only
   python reddit_to_epub.py --sub nosleep --time year --limit 50 --flair OC
 
-  # Alle poster av én forfatter i en subreddit (kronologisk)
+  # All posts by a specific author in a subreddit (chronological)
   python reddit_to_epub.py --sub hfy --author Ralts_Bloodthorne --limit 100
 
-  # En hel serie via HFY-wiki
+  # A full series via the HFY wiki
   python reddit_to_epub.py --series https://www.reddit.com/r/hfy/wiki/series/the_deathworlders
 
-  # Enkelt post via URL
-  python reddit_to_epub.py --url "https://reddit.com/r/hfy/comments/abc123/tittel/"
+  # A single post by URL
+  python reddit_to_epub.py --url "https://reddit.com/r/hfy/comments/abc123/title/"
 
-  # Med egendefinert tittel og minimumsordtelling
-  python reddit_to_epub.py --sub hfy --time all --limit 50 --min-words 1000 --title "HFY Beste 50"
+  # Sort alphabetically so series parts group together
+  python reddit_to_epub.py --sub hfy --time all --limit 50 --sort-chapters title
 """
 
 import argparse
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import requests
@@ -44,15 +44,18 @@ import markdown as md_lib
 from ebooklib import epub
 
 # ─────────────────────────────────────────────────────────────────────
-# KONFIGURASJON
+# CONFIGURATION
 # ─────────────────────────────────────────────────────────────────────
 
-HEADERS      = {"User-Agent": "reddit-to-epub/2.0 (personal use)"}
-REQUEST_DELAY = 1.2
+HEADERS       = {"User-Agent": "reddit-to-epub/2.0 (github.com)"}
+REQUEST_DELAY = 1.2   # seconds between requests
 REDDIT_BASE   = "https://www.reddit.com"
 
+# Estimated words per page on Xteink X4 at medium font size (480x800px)
+WORDS_PER_PAGE = 180
+
 # ─────────────────────────────────────────────────────────────────────
-# CSS – luftig og lesevennlig for e-ink
+# CSS – clean, airy layout optimised for e-ink displays
 # ─────────────────────────────────────────────────────────────────────
 
 CSS = """
@@ -111,47 +114,93 @@ strong { font-weight: bold; }
 """
 
 # ─────────────────────────────────────────────────────────────────────
-# HJELPE-FUNKSJONER
+# HELPERS
 # ─────────────────────────────────────────────────────────────────────
 
+_MONTHS = ["Jan","Feb","Mar","Apr","May","Jun",
+           "Jul","Aug","Sep","Oct","Nov","Dec"]
+
+
+def _format_date(utc_timestamp: float) -> str:
+    """Format a UTC timestamp as 'Jan 05, 2023' — always in English."""
+    dt = datetime.fromtimestamp(utc_timestamp, tz=timezone.utc)
+    return f"{_MONTHS[dt.month - 1]} {dt.day:02d}, {dt.year}"
+
+
 def _get(url: str, params: dict = None) -> dict:
+    """Make a GET request to the Reddit JSON API."""
     r = requests.get(url, headers=HEADERS, params=params, timeout=15)
     r.raise_for_status()
     return r.json()
 
 
 def _clean(text: str):
+    """Return None if the post body is empty, removed, or deleted."""
     t = text.strip()
     return None if (not t or t in ("[removed]", "[deleted]")) else t
 
 
 def _esc(s: str) -> str:
-    return s.replace("&","&amp;").replace("<","&lt;").replace(">","&gt;").replace('"',"&quot;")
+    """Minimal HTML escaping for metadata strings."""
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace('"', "&quot;"))
 
 
 def _make_post(data: dict, series_name: str = None) -> dict | None:
+    """
+    Convert raw Reddit API post data into a clean dict.
+    Returns None for link posts, removed posts, and empty posts.
+    """
     text = _clean(data.get("selftext", ""))
     if not text or not data.get("is_self"):
         return None
     return {
-        "title":       data.get("title", "Uten tittel"),
-        "author":      data.get("author", "ukjent"),
+        "title":       data.get("title", "Untitled"),
+        "author":      data.get("author", "unknown"),
         "subreddit":   data.get("subreddit", ""),
         "series":      series_name,
         "text":        text,
         "score":       data.get("score", 0),
         "created_utc": data.get("created_utc", 0),
-        "created_str": datetime.fromtimestamp(
-                           data.get("created_utc", 0), tz=datetime.now().astimezone().tzinfo
-                       ).strftime("%d. %b %Y"),
+        "created_str": _format_date(data.get("created_utc", 0)),
         "flair":       data.get("link_flair_text") or "",
         "url":         REDDIT_BASE + data.get("permalink", ""),
         "word_count":  len(text.split()),
     }
 
 
+def _make_filename(args) -> str:
+    """
+    Build a descriptive filename that includes all active filters.
+    Example: reddit_hfy_top_all_limit50_minwords500_flair_OC.epub
+    """
+    if args.url:
+        return "reddit_single_post.epub"
+    if args.series:
+        slug = args.series.rstrip("/").split("/")[-1]
+        return f"reddit_series_{slug}.epub"
+
+    parts = ["reddit", args.sub]
+
+    if args.author:
+        parts.append(f"author_{args.author}")
+    else:
+        parts.append(f"top_{args.time_filter}")
+        parts.append(f"limit{args.limit}")
+        if args.min_words:
+            parts.append(f"minwords{args.min_words}")
+        if args.flair:
+            parts.append(f"flair_{args.flair}")
+        if args.sort_chapters != "original":
+            parts.append(f"sort_{args.sort_chapters}")
+
+    return "_".join(parts) + ".epub"
+
+
 # ─────────────────────────────────────────────────────────────────────
-# REDDIT-HENTING
+# FETCHING
 # ─────────────────────────────────────────────────────────────────────
 
 def fetch_subreddit_posts(
@@ -162,17 +211,16 @@ def fetch_subreddit_posts(
     flair:       str = None,
     author:      str = None,
 ) -> list[dict]:
-    """Henter tekstposter fra en subreddit sortert etter top."""
-    posts = []
-    after = None
-    # Hent ekstra buffer hvis vi filtrerer, ellers nøyaktig antall
+    """Fetch text posts from a subreddit sorted by top."""
+    posts  = []
+    after  = None
     budget = min(limit * 5, 500) if (flair or author or min_words) else limit
 
-    print(f"\n📥 Henter fra r/{subreddit}  [top/{time_filter}, maks {limit}]")
+    print(f"\n📥 Fetching from r/{subreddit}  [top/{time_filter}, max {limit}]")
 
     while len(posts) < limit and budget > 0:
         page_size = min(100, budget)
-        params = {"limit": page_size, "t": time_filter}
+        params    = {"limit": page_size, "t": time_filter}
         if after:
             params["after"] = after
 
@@ -188,11 +236,11 @@ def fetch_subreddit_posts(
             post = _make_post(child["data"])
             if post is None:
                 continue
-            if min_words  and post["word_count"] < min_words:
+            if min_words and post["word_count"] < min_words:
                 continue
-            if flair      and flair.lower() not in post["flair"].lower():
+            if flair     and flair.lower() not in post["flair"].lower():
                 continue
-            if author     and post["author"].lower() != author.lower():
+            if author    and post["author"].lower() != author.lower():
                 continue
             posts.append(post)
             if len(posts) >= limit:
@@ -202,7 +250,7 @@ def fetch_subreddit_posts(
             break
         time.sleep(REQUEST_DELAY)
 
-    print(f"   ✓ {len(posts)} poster funnet")
+    print(f"   ✓ {len(posts)} posts found")
     return posts[:limit]
 
 
@@ -212,11 +260,11 @@ def fetch_user_posts(
     limit:     int = 100,
     min_words: int = 0,
 ) -> list[dict]:
-    """Henter alle poster av én bruker i en subreddit (kronologisk)."""
+    """Fetch all posts by a specific user in a subreddit (chronological)."""
     posts = []
     after = None
 
-    print(f"\n📥 Henter poster av u/{author} i r/{subreddit}")
+    print(f"\n📥 Fetching posts by u/{author} in r/{subreddit}")
 
     while len(posts) < limit:
         params = {"limit": 100, "sort": "new"}
@@ -245,41 +293,39 @@ def fetch_user_posts(
             break
         time.sleep(REQUEST_DELAY)
 
-    posts.sort(key=lambda p: p["created_utc"])   # kronologisk
-    print(f"   ✓ {len(posts)} poster funnet")
+    posts.sort(key=lambda p: p["created_utc"])
+    print(f"   ✓ {len(posts)} posts found")
     return posts[:limit]
 
 
 def fetch_single_post(url: str, series_name: str = None) -> dict | None:
-    """Henter én enkelt post via full Reddit-URL."""
+    """Fetch a single Reddit post by its full URL."""
     data = _get(url.rstrip("/") + ".json")
     return _make_post(data[0]["data"]["children"][0]["data"], series_name)
 
 
 def fetch_series_from_wiki(wiki_url: str, min_words: int = 0) -> list[dict]:
     """
-    Henter alle poster i en serie via en HFY wiki-side.
-    Eks.: https://www.reddit.com/r/hfy/wiki/series/the_deathworlders
+    Fetch all posts in a series using an HFY wiki page.
+    Example: https://www.reddit.com/r/hfy/wiki/series/the_deathworlders
     """
     series_name = wiki_url.rstrip("/").split("/")[-1].replace("_", " ").title()
-    print(f"\n📥 Henter serie «{series_name}» fra wiki")
+    print(f"\n📥 Fetching series '{series_name}' from wiki")
 
     data    = _get(wiki_url.rstrip("/") + ".json")
     wiki_md = data["data"]["content_md"]
 
-    # Finn alle Reddit-post-lenker i wikiteksten
     links_raw = re.findall(
         r'https?://(?:www\.)?reddit\.com/r/\w+/comments/\w+/[^\s\)\]"\']*',
         wiki_md,
     )
-    # Dedupliser, bevar rekkefølge
     seen, links = set(), []
-    for l in links_raw:
-        if l not in seen:
-            seen.add(l)
-            links.append(l)
+    for link in links_raw:
+        if link not in seen:
+            seen.add(link)
+            links.append(link)
 
-    print(f"   Fant {len(links)} lenker")
+    print(f"   Found {len(links)} links")
 
     posts = []
     for i, link in enumerate(links, 1):
@@ -290,30 +336,32 @@ def fetch_series_from_wiki(wiki_url: str, min_words: int = 0) -> list[dict]:
             if post and (not min_words or post["word_count"] >= min_words):
                 posts.append(post)
         except Exception as e:
-            print(f"          ⚠ Hoppet over: {e}")
+            print(f"          ⚠ Skipped: {e}")
         time.sleep(REQUEST_DELAY)
 
-    print(f"   ✓ {len(posts)} kapitler hentet")
+    print(f"   ✓ {len(posts)} chapters fetched")
     return posts
 
 
 # ─────────────────────────────────────────────────────────────────────
-# INNHOLDSFORMATERING
+# FORMATTING
 # ─────────────────────────────────────────────────────────────────────
 
 def reddit_md_to_html(text: str) -> str:
+    """Convert Reddit-flavoured Markdown to HTML."""
     text = re.sub(r"\n{3,}", "\n\n", text)
     return md_lib.markdown(text, extensions=["extra", "nl2br"])
 
 
 def post_to_xhtml(post: dict) -> str:
+    """Build a complete XHTML chapter for a single post."""
     meta_parts = [f"r/{post['subreddit']}"]
     if post.get("series"):
-        meta_parts.append(f"Serie: {post['series']}")
-    meta_parts.append(f"Publisert {post['created_str']}")
-    meta_parts.append(f"↑ {post['score']:,} upvotes")
+        meta_parts.append(f"Series: {post['series']}")
+    meta_parts.append(f"Posted {post['created_str']}")
+    meta_parts.append(f"\u2191 {post['score']:,} upvotes")
     meta_parts.append(f"u/{post['author']}")
-    meta_str = "  ·  ".join(meta_parts)
+    meta_str = "  \u00b7  ".join(meta_parts)
 
     return f"""<?xml version="1.0" encoding="utf-8"?>
 <!DOCTYPE html>
@@ -333,10 +381,11 @@ def post_to_xhtml(post: dict) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────
-# EPUB-BYGGING
+# EPUB BUILDER
 # ─────────────────────────────────────────────────────────────────────
 
 def build_epub(posts: list[dict], output_path: Path, book_title: str) -> None:
+    """Assemble and write the final EPUB file."""
     book = epub.EpubBook()
     book.set_identifier(f"reddit-epub-{datetime.now().strftime('%Y%m%d%H%M%S')}")
     book.set_title(book_title)
@@ -351,9 +400,13 @@ def build_epub(posts: list[dict], output_path: Path, book_title: str) -> None:
     book.add_item(style)
 
     chapters, toc, total_words = [], [], 0
-    print(f"\n📖 Bygger EPUB med {len(posts)} kapitler...")
+    cumulative_words = 0
+    print(f"\n📖 Building EPUB with {len(posts)} chapters...")
 
     for i, post in enumerate(posts, 1):
+        # Estimated page number based on X4 screen at medium font
+        est_page = max(1, round(cumulative_words / WORDS_PER_PAGE) + 1)
+
         chap = epub.EpubHtml(
             title=post["title"],
             file_name=f"Text/chap_{i:04d}.xhtml",
@@ -363,8 +416,13 @@ def build_epub(posts: list[dict], output_path: Path, book_title: str) -> None:
         chap.add_item(style)
         book.add_item(chap)
         chapters.append(chap)
-        toc.append(epub.Link(f"Text/chap_{i:04d}.xhtml", post["title"], f"chap{i}"))
-        total_words += post["word_count"]
+
+        # TOC entry includes estimated page number
+        toc_title = f"{post['title']}  (~p. {est_page})"
+        toc.append(epub.Link(f"Text/chap_{i:04d}.xhtml", toc_title, f"chap{i}"))
+
+        cumulative_words += post["word_count"]
+        total_words      += post["word_count"]
 
     book.toc   = toc
     book.spine = ["nav"] + chapters
@@ -374,11 +432,11 @@ def build_epub(posts: list[dict], output_path: Path, book_title: str) -> None:
     epub.write_epub(str(output_path), book)
 
     size_kb = output_path.stat().st_size // 1024
-    print(f"\n✅ Ferdig!")
-    print(f"   Fil:       {output_path}")
-    print(f"   Kapitler:  {len(posts)}")
-    print(f"   Ord:       {total_words:,}")
-    print(f"   Størrelse: {size_kb} KB")
+    print(f"\n✅ Done!")
+    print(f"   File:     {output_path}")
+    print(f"   Chapters: {len(posts)}")
+    print(f"   Words:    {total_words:,}")
+    print(f"   Size:     {size_kb} KB")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -387,71 +445,70 @@ def build_epub(posts: list[dict], output_path: Path, book_title: str) -> None:
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Last ned Reddit-historier og pakk dem som EPUB for Xteink X4.",
+        description="Download Reddit stories and package them as a clean EPUB.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
-EKSEMPLER:
+EXAMPLES:
   %(prog)s --sub hfy --time all --limit 50
   %(prog)s --sub nosleep --time year --limit 30 --min-words 500
   %(prog)s --sub hfy --author Ralts_Bloodthorne --limit 100
   %(prog)s --series https://www.reddit.com/r/hfy/wiki/series/the_deathworlders
-  %(prog)s --url "https://reddit.com/r/hfy/comments/abc123/tittel/"
+  %(prog)s --url "https://reddit.com/r/hfy/comments/abc123/title/"
+  %(prog)s --sub hfy --time all --limit 50 --sort-chapters title
         """,
     )
 
     src = p.add_mutually_exclusive_group(required=True)
     src.add_argument("--sub",    metavar="SUBREDDIT",
-                     help="Subreddit å hente fra (uten r/)")
+                     help="Subreddit to fetch from (without r/)")
     src.add_argument("--series", metavar="WIKI_URL",
-                     help="HFY wiki-URL til en hel serie")
+                     help="HFY wiki URL for a full series")
     src.add_argument("--url",    metavar="URL",
-                     help="URL til én enkelt Reddit-post")
+                     help="URL to a single Reddit post")
 
-    p.add_argument("--author",    metavar="BRUKERNAVN",
-                   help="Kun poster fra denne brukeren (kombineres med --sub)")
-    p.add_argument("--flair",     metavar="TEKST",
-                   help="Kun poster med denne flair-teksten (f.eks. OC)")
+    p.add_argument("--author",    metavar="USERNAME",
+                   help="Only include posts by this user (use with --sub)")
+    p.add_argument("--flair",     metavar="TEXT",
+                   help="Only include posts with this flair text (e.g. OC)")
     p.add_argument("--time",
-                   choices=["hour","day","week","month","year","all"],
+                   choices=["hour", "day", "week", "month", "year", "all"],
                    default="all", dest="time_filter",
-                   help="Tidsperiode for top-sortering (standard: all)")
-    p.add_argument("--limit", type=int, default=25,
-                   help="Maks antall historier (standard: 25)")
+                   help="Time filter for top sorting (default: all)")
+    p.add_argument("--limit",     type=int, default=25,
+                   help="Maximum number of stories to fetch (default: 25)")
     p.add_argument("--min-words", type=int, default=0, metavar="N",
-                   help="Filtrer bort historier kortere enn N ord")
+                   help="Skip posts shorter than N words")
     p.add_argument("--sort-chapters",
-                   choices=["score","date","original"],
+                   choices=["score", "date", "original", "title"],
                    default="original",
-                   help="Rekkefølge i boken: score | date | original (standard: original)")
-    p.add_argument("--title",  metavar="TITTEL",
-                   help="Egendefinert boktittel")
-    p.add_argument("--output", metavar="FIL",
-                   help="Output-filnavn (standard: auto-generert)")
+                   help="Chapter order: score | date | title | original (default: original)")
+    p.add_argument("--title",  metavar="TITLE",
+                   help="Custom book title (default: auto-generated)")
+    p.add_argument("--output", metavar="FILE",
+                   help="Output filename (default: auto-generated from filters)")
     return p.parse_args()
 
 
 def main():
-    for pkg in ("requests", "ebooklib", "markdown"):
-        try:
-            __import__(pkg.replace("-", "_"))
-        except ImportError:
-            print(f"Mangler pakke: {pkg}\nKjør:  pip install requests ebooklib markdown")
-            sys.exit(1)
+    missing = [pkg for pkg in ("requests", "ebooklib", "markdown")
+               if not __import__("importlib").util.find_spec(pkg)]
+    if missing:
+        print(f"Missing packages: {', '.join(missing)}")
+        print(f"Run:  pip install {' '.join(missing)}")
+        sys.exit(1)
 
     args = parse_args()
 
-    # ── Hent poster ──────────────────────────────────────────────────
+    # ── Fetch posts ───────────────────────────────────────────────────
     if args.url:
-        post = fetch_single_post(args.url)
+        post          = fetch_single_post(args.url)
         posts         = [post] if post else []
         default_title = posts[0]["title"] if posts else "Reddit post"
-        default_file  = "reddit_post.epub"
 
     elif args.series:
         posts         = fetch_series_from_wiki(args.series, min_words=args.min_words)
-        series_slug   = args.series.rstrip("/").split("/")[-1]
-        default_title = series_slug.replace("_", " ").title()
-        default_file  = f"{series_slug}.epub"
+        series_name   = args.series.rstrip("/").split("/")[-1].replace("_", " ").title()
+        default_title = series_name
 
     else:
         if args.author:
@@ -462,7 +519,6 @@ def main():
                 min_words=args.min_words,
             )
             default_title = f"u/{args.author} – r/{args.sub}"
-            default_file  = f"r_{args.sub}_{args.author}.epub"
         else:
             posts = fetch_subreddit_posts(
                 subreddit=args.sub,
@@ -472,26 +528,24 @@ def main():
                 flair=args.flair,
                 author=args.author,
             )
-            suffix        = f"_{args.flair}" if args.flair else ""
-            default_title = f"r/{args.sub} – top {args.time_filter}{suffix}"
-            default_file  = f"r_{args.sub}_top_{args.time_filter}{suffix}.epub"
+            suffix        = f" [{args.flair}]" if args.flair else ""
+            default_title = f"r/{args.sub} – top {args.time_filter}, limit {args.limit}{suffix}"
 
     if not posts:
-        print("\n✗ Ingen poster funnet.")
+        print("\n✗ No posts found. Check the subreddit name and your connection.")
         sys.exit(1)
 
-    # ── Sortering innad i dokumentet ─────────────────────────────────
+    # ── Sort chapters ─────────────────────────────────────────────────
     if args.sort_chapters == "score":
         posts.sort(key=lambda p: p["score"], reverse=True)
     elif args.sort_chapters == "date":
         posts.sort(key=lambda p: p["created_utc"])
+    elif args.sort_chapters == "title":
+        posts.sort(key=lambda p: p["title"].lower())
 
-    # ── Bygg EPUB ────────────────────────────────────────────────────
-    build_epub(
-        posts,
-        Path(args.output or default_file),
-        args.title or default_title,
-    )
+    # ── Build EPUB ────────────────────────────────────────────────────
+    output_path = Path(args.output or _make_filename(args))
+    build_epub(posts, output_path, args.title or default_title)
 
 
 if __name__ == "__main__":
